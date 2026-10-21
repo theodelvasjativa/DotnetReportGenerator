@@ -658,6 +658,12 @@ function Ensure-DotnetToolsPath {
     Write-Info "Carpeta de herramientas: $toolsDirectory"
 
     if (Test-PathContains $env:Path $toolsDirectory) {
+        # Record ownership if a previous installation wrote the PATH block.
+        if (-not (Test-WindowsPlatform) -and (Test-UnixProfileBlock -Marker $script:MarkerTools)) {
+            $script:ToolsPathAdded = $true
+            $script:RcFilesModified.Add((Get-ShellProfilePath))
+        }
+
         Write-Ok 'La carpeta ya está en el PATH.'
         return
     }
@@ -679,6 +685,7 @@ function Ensure-DotnetToolsPath {
             # The marker identifies the block as ours, even if it was written by
             # a previous installation. Record ownership so uninstall can remove it.
             $script:ToolsPathAdded = $true
+            $script:RcFilesModified.Add((Get-ShellProfilePath))
             Write-Ok 'La carpeta ya estaba configurada en el perfil del shell.'
         }
         else {
@@ -894,6 +901,10 @@ function Register-MainCommand {
         $wrapperPath = Join-Path $binDirectory $script:ToolName
         New-UnixWrapper -Path $wrapperPath -TargetScript $MainScriptPath
         Write-Ok "Wrapper creado: $wrapperPath"
+
+        if (Test-UnixProfileBlock -Marker $script:MarkerMain) {
+            $script:RcFilesModified.Add((Get-ShellProfilePath))
+        }
 
         if (Test-PathContains $env:Path $binDirectory) {
             Write-Ok 'La carpeta ~/.local/bin ya está en el PATH.'

@@ -650,7 +650,6 @@ pwsh ./install.ps1 -UpdateTools
 
 ```text
 DotnetReportGenerator/
-├── .github/workflows/ci.yml            # Integración continua
 ├── tests/
 │   ├── ScriptQuality.Tests.ps1         # Parseo, ayuda y análisis básico
 │   ├── CoverageIntegration.Tests.ps1   # Ejecución real sobre una solución de prueba
@@ -678,7 +677,14 @@ Invoke-Pester ./tests -Output Detailed
 - `CoverageIntegration.Tests.ps1` compila el fixture y valida el reporte, el umbral (3), los tests fallidos (2), `-Force`, el filtro sin coincidencias (1) y la protección de la carpeta de salida.
 - `Install.Tests.ps1` instala y desinstala en un `HOME` temporal (solo Linux/macOS) y verifica el manifiesto y los bloques de `PATH`.
 
-El workflow de `.github/workflows/ci.yml` ejecuta PSScriptAnalyzer (solo errores) y toda la suite en Ubuntu. Las pruebas de integración requieren el SDK de .NET 10 porque el fixture usa `net10.0`; la herramienta en sí sigue funcionando con SDK 8 o superior.
+Las pruebas de integración requieren el SDK de .NET 10 porque el fixture usa `net10.0`; la herramienta en sí sigue funcionando con SDK 8 o superior.
+
+Opcionalmente, para el análisis estático:
+
+```powershell
+Install-Module PSScriptAnalyzer -Scope CurrentUser -Force
+Invoke-ScriptAnalyzer . -Recurse -Severity Error
+```
 
 ---
 
