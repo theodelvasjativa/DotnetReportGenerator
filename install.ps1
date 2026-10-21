@@ -384,9 +384,16 @@ function Get-PortableExportLine {
 
     $homeDirectory = Normalize-PathEntry (Get-UserHome)
     $normalized = Normalize-PathEntry $Directory
+    $homePrefix = $homeDirectory.TrimEnd('/', '\') + [System.IO.Path]::DirectorySeparatorChar
+    $comparison = if (Test-WindowsPlatform) {
+        [System.StringComparison]::OrdinalIgnoreCase
+    }
+    else {
+        [System.StringComparison]::Ordinal
+    }
 
-    if ($normalized.StartsWith($homeDirectory, [System.StringComparison]::Ordinal)) {
-        $relative = $normalized.Substring($homeDirectory.Length).TrimStart('/', '\')
+    if ($normalized.StartsWith($homePrefix, $comparison)) {
+        $relative = $normalized.Substring($homePrefix.Length).TrimStart('/', '\')
         $relative = $relative -replace '\\', '/'
         return 'export PATH="$HOME/' + $relative + ':$PATH"'
     }
@@ -664,20 +671,28 @@ function Ensure-DotnetToolsPath {
             Write-Ok 'Carpeta añadida al PATH del usuario.'
         }
         else {
-            Write-Warn 'No se pudo añadir la carpeta al PATH del usuario.'
-            Add-WarningMessage "Añade manualmente $toolsDirectory al PATH."
+            Write-Ok 'La carpeta ya estaba en el PATH del usuario.'
         }
     }
     else {
-        $profilePath = Add-UnixProfileBlock -Directory $toolsDirectory -Marker $script:MarkerTools
-        if ($null -ne $profilePath) {
+        if (Test-UnixProfileBlock -Marker $script:MarkerTools) {
+            # The marker identifies the block as ours, even if it was written by
+            # a previous installation. Record ownership so uninstall can remove it.
             $script:ToolsPathAdded = $true
-            $script:RcFilesModified.Add($profilePath)
-            $script:NeedsNewTerminal = $true
-            Write-Ok "Carpeta añadida al PATH en $profilePath."
+            Write-Ok 'La carpeta ya estaba configurada en el perfil del shell.'
         }
         else {
-            Write-Ok 'La carpeta ya estaba configurada en el perfil del shell.'
+            $profilePath = Add-UnixProfileBlock -Directory $toolsDirectory -Marker $script:MarkerTools
+            if ($null -ne $profilePath) {
+                $script:ToolsPathAdded = $true
+                $script:RcFilesModified.Add($profilePath)
+                $script:NeedsNewTerminal = $true
+                Write-Ok "Carpeta añadida al PATH en $profilePath."
+            }
+            else {
+                Write-Warn 'No se pudo actualizar el perfil del shell automáticamente.'
+                Add-WarningMessage "Añade manualmente $toolsDirectory al PATH."
+            }
         }
     }
 
@@ -901,6 +916,9 @@ function Register-MainCommand {
                     $script:NeedsNewTerminal = $true
                     Write-Ok "PATH actualizado en $profilePath."
                 }
+                else {
+                    Add-WarningMessage "Añade $binDirectory al PATH para usar el comando desde cualquier terminal."
+                }
             }
             else {
                 Add-WarningMessage "Añade $binDirectory al PATH para usar el comando desde cualquier terminal."
@@ -1019,7 +1037,7 @@ function Invoke-Install {
     }
     else {
         Add-Existing $script:MainScriptName
-        Write-Ok "Script ya actualizado en $destinationScript"
+        Write-Ok "Script ya está actualizado en $destinationScript"
     }
 
     # Remove an old alias if the user chose a different one on reinstall.
@@ -1045,8 +1063,8 @@ function Invoke-Install {
             -MainScriptPath $destinationScript -AliasName $effectiveAlias
     }
 
-    $previousPathEntries = @(Get-ObjectProperty -Object $previousManifest -Name 'pathEntriesAdded' -Default @())
-    $previousRcFiles = @(Get-ObjectProperty -Object $previousManifest -Name 'rcFilesModified' -Default @())
+    $previousPathEntries = @(Get-ObjectProperty -Object $previousManifest -Name 'pathEntries' -Default @())
+    $previousRcFiles = @(Get-ObjectProperty -Object $previousManifest -Name 'rcFiles' -Default @())
 
     $allPathEntries = @($previousPathEntries + $script:PathEntriesAdded | Select-Object -Unique)
     $allRcFiles = @($previousRcFiles + $script:RcFilesModified | Select-Object -Unique)
@@ -1096,6 +1114,12 @@ function Invoke-Uninstall {
 
     $aliasName = [string](Get-ObjectProperty -Object $manifest -Name 'alias' -Default '')
     $rcFiles = @(Get-ObjectProperty -Object $manifest -Name 'rcFiles' -Default @())
+    $toolsPathAdded = [bool](Get-ObjectProperty -Object $manifest -Name 'toolsPathAdded' -Default $false)
+
+    $shouldRemoveTools = $UninstallTools
+    if (-not $script:UninstallToolsSpecified) {
+        $shouldRemoveTools = Confirm-Action -Question '¿Desinstalar también coverlet.console y reportgenerator?' -Default $false
+    }
 
     $removedAnything = $false
 
@@ -1139,6 +1163,14 @@ function Invoke-Uninstall {
             Write-Ok 'Entrada del PATH del usuario eliminada.'
             $removedAnything = $true
         }
+
+        # Only remove the tools directory from PATH when the tools themselves
+        # are being uninstalled; otherwise they would become unreachable.
+        if ($shouldRemoveTools -and $toolsPathAdded -and
+            (Remove-PersistentUserPath -Directory (Get-DotnetToolsDirectory))) {
+            Write-Ok 'Entrada de .dotnet\tools eliminada del PATH del usuario.'
+            $removedAnything = $true
+        }
     }
     else {
         $profilesToClean = @($rcFiles)
@@ -1156,16 +1188,18 @@ function Invoke-Uninstall {
                 Write-Ok "Entrada de PATH eliminada de $profilePath"
                 $removedAnything = $true
             }
+
+            if ($shouldRemoveTools -and $toolsPathAdded -and
+                -not [string]::IsNullOrWhiteSpace($profilePath) -and
+                (Remove-UnixProfileBlock -ProfilePath $profilePath -Marker $script:MarkerTools)) {
+                Write-Ok "Entrada de .NET tools eliminada de $profilePath"
+                $removedAnything = $true
+            }
         }
     }
 
     if (-not $removedAnything) {
         Write-Info 'No se encontró ninguna instalación previa.'
-    }
-
-    $shouldRemoveTools = $UninstallTools
-    if (-not $script:UninstallToolsSpecified) {
-        $shouldRemoveTools = Confirm-Action -Question '¿Desinstalar también coverlet.console y reportgenerator?' -Default $false
     }
 
     if ($shouldRemoveTools) {

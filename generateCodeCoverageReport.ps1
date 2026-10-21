@@ -9,18 +9,26 @@
 
     Funciona en Windows, Linux, macOS y WSL con PowerShell 7.
 
+    Por defecto no se muestra la salida de dotnet, coverlet ni ReportGenerator:
+    se captura y se guarda en <salida>/logs. La consola solo muestra mensajes
+    resumidos. Usa -Verbose para ver la salida completa de las herramientas.
+
 .PARAMETER Solution
     Ruta al archivo .sln/.slnx o a la carpeta que lo contiene. Si se omite, se
     busca en el directorio actual y en los directorios padre hasta la raíz del
     repositorio git o del volumen.
 
 .PARAMETER TestProject
-    Uno o varios archivos .csproj de test (o carpetas que los contengan). Si se
-    indica, se ignora la autodetección de proyectos de test.
+    Uno o varios archivos .csproj/.fsproj/.vbproj de test (o carpetas que los
+    contengan). Si se indica, se ignora la autodetección de proyectos de test.
 
 .PARAMETER Output
     Carpeta donde se genera el reporte. Por defecto:
     <carpeta de la solución>/coverage-report.
+
+    La carpeta se limpia antes de cada ejecución. Si contiene archivos que no
+    parecen de un reporte anterior, se pide confirmación; en modo no interactivo
+    se aborta para no borrar datos por error.
 
 .PARAMETER Configuration
     Configuración de compilación. Por defecto: Debug.
@@ -31,6 +39,8 @@
 
 .PARAMETER Filter
     Filtro que se pasa a dotnet test --filter (por ejemplo "FullyQualifiedName~MiTest").
+    Si el filtro no coincide con ningún test, el script termina con el código 1
+    para evitar reportes vacíos por una errata.
 
 .PARAMETER Formats
     Tipos de reporte de ReportGenerator. Por defecto:
@@ -91,16 +101,25 @@
 
     Ejecuta solo los tests que coinciden con el filtro y conserva los XML.
 
+.EXAMPLE
+    ./generateCodeCoverageReport.ps1 -Verbose
+
+    Muestra la salida completa de dotnet, coverlet y ReportGenerator para depurar.
+
 .NOTES
     Códigos de salida:
       0  Éxito.
-      1  Error de configuración, de solución o de herramientas.
+      1  Error de configuración, de solución o de herramientas, o filtro de
+         tests sin coincidencias.
       2  Tests fallidos (sin -Force).
       3  Umbral de cobertura no alcanzado.
 
     Requiere PowerShell 7 o superior y las herramientas globales
     coverlet.console y dotnet-reportgenerator-globaltool. Usa install.ps1
     para instalarlas.
+
+    Los logs completos de las herramientas se guardan en <salida>/logs.
+    Usa -Verbose para mostrarlos también por consola.
 #>
 
 #Requires -Version 7.0
@@ -192,7 +211,10 @@ $script:NoOpenValue = $NoOpen.IsPresent
 $script:TempDirectory = $null
 $script:CoverletPath = $null
 $script:ReportGeneratorPath = $null
+$script:SdkVersion = $null
 $script:FinalExitCode = 1
+$script:InvocationDirectory = (Get-Location).ProviderPath
+$script:OutputMarkerName = '.coverage-report'
 
 if ($script:IsWindowsHost) {
     $script:DotnetToolsDirectory = Join-Path $env:USERPROFILE '.dotnet\tools'
@@ -261,6 +283,172 @@ function Test-IsInteractive {
     catch {
         return $false
     }
+}
+
+# ---------------------------------------------------------------------------
+# Captured tool output and logs
+# ---------------------------------------------------------------------------
+
+function ConvertTo-LogLines {
+    param($Output)
+
+    $lines = New-Object System.Collections.Generic.List[string]
+    foreach ($item in @($Output)) {
+        if ($null -eq $item) { continue }
+
+        $text = [string]$item
+        $text = $text -replace "`e\[[0-9;]*m", ''
+        $lines.Add($text)
+    }
+
+    return $lines.ToArray()
+}
+
+function Write-ToolLog {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [string[]]$Lines = @()
+    )
+
+    $directory = [System.IO.Path]::GetDirectoryName($Path)
+    if (-not [string]::IsNullOrWhiteSpace($directory) -and
+        -not (Test-Path -LiteralPath $directory -PathType Container)) {
+        New-Item -ItemType Directory -Path $directory -Force | Out-Null
+    }
+
+    $encoding = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllLines($Path, [string[]]$Lines, $encoding)
+}
+
+function Invoke-CapturedTool {
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [Parameter(Mandatory = $true)][string]$LogPath
+    )
+
+    $output = & $FilePath @Arguments 2>&1
+    $exitCode = $LASTEXITCODE
+    $lines = @(ConvertTo-LogLines -Output $output)
+
+    Write-ToolLog -Path $LogPath -Lines $lines
+
+    if ($VerbosePreference -eq 'Continue') {
+        foreach ($line in $lines) {
+            Write-Host "         $line" -ForegroundColor DarkGray
+        }
+    }
+
+    return [pscustomobject]@{
+        ExitCode = $exitCode
+        Lines    = $lines
+        LogPath  = $LogPath
+    }
+}
+
+function Get-FailedTestsFromTrx {
+    param([Parameter(Mandatory = $true)][string]$TrxPath)
+
+    if (-not (Test-Path -LiteralPath $TrxPath -PathType Leaf)) { return @() }
+
+    try {
+        [xml]$document = Get-Content -LiteralPath $TrxPath -Raw -Encoding utf8 -ErrorAction Stop
+    }
+    catch {
+        return @()
+    }
+
+    $failedOutcomes = @('Failed', 'Error', 'Timeout', 'Aborted')
+    $names = New-Object System.Collections.Generic.List[string]
+
+    foreach ($result in @($document.SelectNodes("//*[local-name()='UnitTestResult']"))) {
+        $outcome = [string]$result.GetAttribute('outcome')
+        if ($outcome -notin $failedOutcomes) { continue }
+
+        $name = [string]$result.GetAttribute('testName')
+        if (-not [string]::IsNullOrWhiteSpace($name)) {
+            $names.Add($name)
+        }
+    }
+
+    return @($names | Select-Object -Unique)
+}
+
+function Get-TestResultCounts {
+    param([Parameter(Mandatory = $true)][string]$TrxPath)
+
+    if (-not (Test-Path -LiteralPath $TrxPath -PathType Leaf)) { return $null }
+
+    try {
+        [xml]$document = Get-Content -LiteralPath $TrxPath -Raw -Encoding utf8 -ErrorAction Stop
+    }
+    catch {
+        return $null
+    }
+
+    $results = @($document.SelectNodes("//*[local-name()='UnitTestResult']"))
+    if ($results.Count -eq 0) { return $null }
+
+    $passed = 0
+    $failed = 0
+    $skipped = 0
+
+    foreach ($result in $results) {
+        $outcome = [string]$result.GetAttribute('outcome')
+        switch ($outcome) {
+            'Passed' { $passed++ }
+            'Failed' { $failed++ }
+            'Error' { $failed++ }
+            'Timeout' { $failed++ }
+            'Aborted' { $failed++ }
+            'NotExecuted' { $skipped++ }
+            'Inconclusive' { $skipped++ }
+            default { $skipped++ }
+        }
+    }
+
+    return [pscustomobject]@{
+        Passed  = $passed
+        Failed  = $failed
+        Skipped = $skipped
+        Total   = $results.Count
+    }
+}
+
+function Get-FailedTestsFromOutput {
+    param([string[]]$Lines)
+
+    $names = New-Object System.Collections.Generic.List[string]
+
+    foreach ($line in $Lines) {
+        if ($line -match '^\s*Failed\s+(.+?)(?:\s+\[.*\])?\s*$') {
+            $names.Add($Matches[1].Trim())
+            continue
+        }
+
+        if ($line -match '^\s*\[[^\]]+\]\s+(.+?)\s+\[FAIL\]\s*$') {
+            $names.Add($Matches[1].Trim())
+            continue
+        }
+
+        if ($line -match '\[FAIL\]\s+(.+?)\s*$') {
+            $names.Add($Matches[1].Trim())
+        }
+    }
+
+    return @($names | Select-Object -Unique)
+}
+
+function Test-NoTestsMatchedOutput {
+    param([string[]]$Lines)
+
+    foreach ($line in $Lines) {
+        if ($line -match 'No test matches|No tests matched|No test is available|no se encontró ningún test|Ningún test') {
+            return $true
+        }
+    }
+
+    return $false
 }
 
 # ---------------------------------------------------------------------------
@@ -498,7 +686,7 @@ function Resolve-SolutionInfo {
         return (New-SolutionInfo -Path $resolved)
     }
 
-    $found = Find-Solution -StartDirectory (Get-Location).ProviderPath
+    $found = Find-Solution -StartDirectory $script:InvocationDirectory
     if ($null -eq $found) {
         throw [CoverageException]::new(
             'No se encontró ninguna solución .sln/.slnx en el directorio actual ni en sus padres. Usa -Solution.',
@@ -509,25 +697,129 @@ function Resolve-SolutionInfo {
     return (New-SolutionInfo -Path $found.FullName)
 }
 
+function Resolve-SolutionProjectPath {
+    param(
+        [Parameter(Mandatory = $true)][string]$SolutionDirectory,
+        [Parameter(Mandatory = $true)][string]$Reference
+    )
+
+    $normalized = $Reference.Trim() -replace '\\', '/'
+    if ([System.IO.Path]::IsPathRooted($normalized)) {
+        return [System.IO.Path]::GetFullPath($normalized)
+    }
+
+    return [System.IO.Path]::GetFullPath((Join-Path $SolutionDirectory $normalized))
+}
+
+function Get-ProjectsFromSlnx {
+    param([Parameter(Mandatory = $true)][string]$SolutionPath)
+
+    $solutionDirectory = [System.IO.Path]::GetDirectoryName($SolutionPath)
+
+    try {
+        [xml]$document = Get-Content -LiteralPath $SolutionPath -Raw -Encoding utf8 -ErrorAction Stop
+    }
+    catch {
+        throw [CoverageException]::new(
+            "No se pudo leer el XML de la solución .slnx '$SolutionPath': $($_.Exception.Message)",
+            1
+        )
+    }
+
+    $nodes = @($document.SelectNodes("//*[local-name()='Project']"))
+    if ($nodes.Count -eq 0) {
+        throw [CoverageException]::new("La solución .slnx no contiene proyectos: $SolutionPath", 1)
+    }
+
+    $projects = New-Object System.Collections.Generic.List[string]
+
+    foreach ($node in $nodes) {
+        $reference = [string]$node.GetAttribute('Path')
+        if ([string]::IsNullOrWhiteSpace($reference)) { continue }
+
+        $extension = [System.IO.Path]::GetExtension(($reference -replace '\\', '/')).ToLowerInvariant()
+        if ($extension -notin @('.csproj', '.fsproj', '.vbproj')) { continue }
+
+        $fullPath = Resolve-SolutionProjectPath -SolutionDirectory $solutionDirectory -Reference $reference
+        if (-not (Test-Path -LiteralPath $fullPath -PathType Leaf)) {
+            throw [CoverageException]::new(
+                "El proyecto '$reference' referenciado en '$SolutionPath' no existe en '$fullPath'.",
+                1
+            )
+        }
+
+        $projects.Add($fullPath)
+    }
+
+    if ($projects.Count -eq 0) {
+        throw [CoverageException]::new("No se encontraron proyectos .NET dentro de $SolutionPath.", 1)
+    }
+
+    return @($projects | Select-Object -Unique)
+}
+
+function Get-ProjectsFromSln {
+    param([Parameter(Mandatory = $true)][string]$SolutionPath)
+
+    $solutionDirectory = [System.IO.Path]::GetDirectoryName($SolutionPath)
+
+    try {
+        $lines = @(Get-Content -LiteralPath $SolutionPath -Encoding utf8 -ErrorAction Stop)
+    }
+    catch {
+        throw [CoverageException]::new(
+            "No se pudo leer la solución .sln '$SolutionPath': $($_.Exception.Message)",
+            1
+        )
+    }
+
+    $projects = New-Object System.Collections.Generic.List[string]
+    $projectPattern = '^\s*Project\("\{[^}]+\}"\)\s*=\s*"[^"]*"\s*,\s*"([^"]+)"'
+
+    foreach ($line in $lines) {
+        if ($line -notmatch $projectPattern) { continue }
+
+        $reference = $Matches[1]
+        if ($reference -notmatch '\.(cs|fs|vb)proj$') { continue }
+
+        $fullPath = Resolve-SolutionProjectPath -SolutionDirectory $solutionDirectory -Reference $reference
+        if (-not (Test-Path -LiteralPath $fullPath -PathType Leaf)) {
+            throw [CoverageException]::new(
+                "El proyecto '$reference' referenciado en '$SolutionPath' no existe en '$fullPath'.",
+                1
+            )
+        }
+
+        $projects.Add($fullPath)
+    }
+
+    if ($projects.Count -eq 0) {
+        throw [CoverageException]::new("No se encontraron proyectos .NET dentro de $SolutionPath.", 1)
+    }
+
+    return @($projects | Select-Object -Unique)
+}
+
 function Get-SolutionProjects {
     param([Parameter(Mandatory = $true)]$SolutionInfo)
 
-    Write-Info "Leyendo proyectos de la solución..."
+    if ($SolutionInfo.Extension -eq '.slnx') {
+        Write-Info 'Leyendo proyectos del XML nativo de la solución .slnx...'
+        return @(Get-ProjectsFromSlnx -SolutionPath $SolutionInfo.Path)
+    }
+
+    Write-Info 'Leyendo proyectos de la solución...'
     $output = & dotnet sln $SolutionInfo.Path list 2>&1
     $exitCode = $LASTEXITCODE
 
     if ($exitCode -ne 0) {
         $details = (@($output) | Out-String).Trim()
-
-        if ($SolutionInfo.Extension -eq '.slnx') {
-            throw [CoverageException]::new(
-                "No se pudo leer la solución .slnx. Tu SDK de .NET no soporta este formato. " +
-                "Actualiza a .NET SDK 9.0.200 o superior, o usa un archivo .sln.`n$details",
-                1
-            )
+        Write-Warn "No se pudo usar 'dotnet sln list'; se usará el parser nativo de .sln."
+        if (-not [string]::IsNullOrWhiteSpace($details)) {
+            Write-Detail $details
         }
 
-        throw [CoverageException]::new("No se pudo leer la solución con 'dotnet sln list'.`n$details", 1)
+        return @(Get-ProjectsFromSln -SolutionPath $SolutionInfo.Path)
     }
 
     $projects = New-Object System.Collections.Generic.List[string]
@@ -693,11 +985,15 @@ function Resolve-TestProjectArguments {
         $resolved = Resolve-UserPath -Path $value
 
         if (Test-Path -LiteralPath $resolved -PathType Container) {
-            $projects = @(Get-ChildItem -LiteralPath $resolved -File -Filter '*.csproj' -ErrorAction SilentlyContinue |
+            $projects = @(Get-ChildItem -LiteralPath $resolved -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Extension -in @('.csproj', '.fsproj', '.vbproj') } |
                 Sort-Object -Property FullName)
 
             if ($projects.Count -eq 0) {
-                throw [CoverageException]::new("No se encontró ningún .csproj en '$resolved'.", 1)
+                throw [CoverageException]::new(
+                    "No se encontró ningún proyecto .csproj/.fsproj/.vbproj en '$resolved'.",
+                    1
+                )
             }
 
             foreach ($project in $projects) {
@@ -705,8 +1001,8 @@ function Resolve-TestProjectArguments {
             }
         }
         elseif (Test-Path -LiteralPath $resolved -PathType Leaf) {
-            if ([System.IO.Path]::GetExtension($resolved).ToLowerInvariant() -ne '.csproj') {
-                throw [CoverageException]::new("El proyecto indicado no es un archivo .csproj: $resolved", 1)
+            if ([System.IO.Path]::GetExtension($resolved).ToLowerInvariant() -notin @('.csproj', '.fsproj', '.vbproj')) {
+                throw [CoverageException]::new("El proyecto indicado no es un archivo .csproj/.fsproj/.vbproj: $resolved", 1)
             }
 
             $result.Add((New-TestProjectInfo -Path $resolved))
@@ -779,14 +1075,14 @@ function Assert-OutputDirectoryIsSafe {
         }
     }
 
-    if (Test-SamePath -Left $fullPath -Right (Get-Location).ProviderPath) {
+    if (Test-SamePath -Left $fullPath -Right $script:InvocationDirectory) {
         throw [CoverageException]::new(
             "La carpeta de salida no puede ser el directorio actual. Usa una subcarpeta dedicada.",
             1
         )
     }
 
-    if (Test-PathInside -Child (Get-Location).ProviderPath -Parent $fullPath) {
+    if (Test-PathInside -Child $script:InvocationDirectory -Parent $fullPath) {
         throw [CoverageException]::new(
             "La carpeta de salida ($fullPath) contiene el directorio actual y se borraría el trabajo en curso.",
             1
@@ -806,6 +1102,46 @@ function Assert-OutputDirectoryIsSafe {
     }
 }
 
+function Test-IsCoverageOutputDirectory {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $items = @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue)
+    if ($items.Count -eq 0) { return $true }
+
+    $hasMarker = @($items |
+        Where-Object { -not $_.PSIsContainer -and $_.Name -eq $script:OutputMarkerName }).Count -gt 0
+    $signatures = @('Summary.json', 'Summary.txt', 'index.html', 'index.htm', 'Cobertura.xml')
+    $hasSignature = @($items |
+        Where-Object { -not $_.PSIsContainer -and $_.Name -in $signatures }).Count -gt 0
+
+    if (-not $hasMarker -and -not $hasSignature) { return $false }
+
+    # Only allow the artifacts ReportGenerator writes. A broad extension
+    # whitelist would still let us delete unrelated .txt/.json files.
+    $allowedFiles = @(
+        $script:OutputMarkerName,
+        'index.html', 'index.htm', 'Summary.json', 'Summary.txt',
+        'Cobertura.xml', 'report.css', 'main.js', 'class.js', 'favicon.ico'
+    )
+    $allowedDirectories = @('history', 'logs', 'raw')
+
+    foreach ($item in $items) {
+        if ($item.PSIsContainer) {
+            if ($item.Name -notin $allowedDirectories) { return $false }
+            continue
+        }
+
+        if ($item.Name -in $allowedFiles) { continue }
+        if ($item.Name -like 'icon_*.svg') { continue }
+        if ($item.Name -like 'badge_*.svg') { continue }
+        if ($item.Extension -in @('.html', '.htm')) { continue }
+
+        return $false
+    }
+
+    return $true
+}
+
 function Initialize-OutputDirectory {
     param(
         [Parameter(Mandatory = $true)][string]$OutputPath,
@@ -821,14 +1157,119 @@ function Initialize-OutputDirectory {
 
     if (-not (Test-Path -LiteralPath $OutputPath -PathType Container)) {
         New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null
-        return
+    }
+    else {
+        if (-not (Test-IsCoverageOutputDirectory -Path $OutputPath)) {
+            $names = @(Get-ChildItem -LiteralPath $OutputPath -Force -ErrorAction SilentlyContinue |
+                Select-Object -First 8 -ExpandProperty Name)
+            Write-Warn "La carpeta de salida contiene archivos que no parecen de un reporte anterior: $($names -join ', ')"
+
+            if (-not (Test-IsInteractive)) {
+                throw [CoverageException]::new(
+                    "La carpeta de salida '$OutputPath' no está vacía y contiene archivos que no parecen de un reporte. " +
+                    'Usa una carpeta vacía o dedicada para no borrar datos.',
+                    1
+                )
+            }
+
+            $answer = Read-Host '    ¿Borrar todo su contenido igualmente? [s/N]'
+            $normalized = ([string]$answer).Trim().ToLowerInvariant()
+            if ($normalized -notin @('s', 'si', 'sí', 'y', 'yes')) {
+                throw [CoverageException]::new("Operación cancelada: no se ha modificado '$OutputPath'.", 1)
+            }
+        }
+
+        $items = @(Get-ChildItem -LiteralPath $OutputPath -Force -ErrorAction SilentlyContinue)
+        foreach ($item in $items) {
+            if ($KeepHistory -and $item.PSIsContainer -and $item.Name -eq 'history') { continue }
+            Remove-Item -LiteralPath $item.FullName -Recurse -Force
+        }
     }
 
-    $items = @(Get-ChildItem -LiteralPath $OutputPath -Force -ErrorAction SilentlyContinue)
-    foreach ($item in $items) {
-        if ($KeepHistory -and $item.PSIsContainer -and $item.Name -eq 'history') { continue }
-        Remove-Item -LiteralPath $item.FullName -Recurse -Force
+    # Marker used to recognise our own output directories, including runs
+    # interrupted before ReportGenerator writes Summary.json or index.html.
+    $markerPath = Join-Path $OutputPath $script:OutputMarkerName
+    $encoding = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($markerPath, "generateCodeCoverageReport`n", $encoding)
+}
+
+# ---------------------------------------------------------------------------
+# .NET SDK discovery
+# ---------------------------------------------------------------------------
+
+function Get-DotNetSdkVersion {
+    $dotnetCommand = Get-Command dotnet -ErrorAction SilentlyContinue
+    if ($null -eq $dotnetCommand) {
+        throw [CoverageException]::new(
+            "No se encontró 'dotnet'. Instala el SDK de .NET 8 o superior y vuelve a intentarlo.`n" +
+            'https://dotnet.microsoft.com/download',
+            1
+        )
     }
+
+    $output = & dotnet --version 2>&1
+    $exitCode = $LASTEXITCODE
+    $text = ((@($output) | ForEach-Object { [string]$_ }) -join [Environment]::NewLine) -replace "`e\[[0-9;]*m", ''
+    $trimmed = $text.Trim()
+
+    if ($exitCode -ne 0) {
+        $globalJsonPath = $null
+        $requestedVersion = $null
+
+        if ($trimmed -match 'global\.json file:\s*(.+)') {
+            $globalJsonPath = $Matches[1].Trim()
+        }
+
+        if ($trimmed -match 'Requested SDK version:\s*(\S+)') {
+            $requestedVersion = $Matches[1].Trim()
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($globalJsonPath)) {
+            $installedSdkLines = @([regex]::Matches(
+                $trimmed,
+                '(?m)^\s*(\d+\.\d+\.\d+[^\s\[]*)\s+\[([^\]]+)\]\s*$'
+            ) | ForEach-Object {
+                "$($_.Groups[1].Value) [$($_.Groups[2].Value)]"
+            })
+
+            $message = "No se pudo iniciar el SDK de .NET en el directorio actual.`n`n" +
+                "         El repositorio fija el SDK en:`n" +
+                "           $globalJsonPath`n"
+
+            if (-not [string]::IsNullOrWhiteSpace($requestedVersion)) {
+                $message += "         Versión solicitada: $requestedVersion`n"
+            }
+
+            if ($installedSdkLines.Count -gt 0) {
+                $message += "         SDKs instalados:`n" +
+                    (($installedSdkLines | ForEach-Object { '           ' + $_ }) -join [Environment]::NewLine) + "`n"
+            }
+
+            $message += '         Instala la versión solicitada o ajusta global.json. Este script no modifica global.json.'
+        }
+        else {
+            $indented = (@($trimmed -split "`r?`n") | ForEach-Object { '         ' + $_ }) -join [Environment]::NewLine
+            $message = "No se pudo iniciar el SDK de .NET en el directorio actual.`n$indented"
+        }
+
+        throw [CoverageException]::new($message, 1)
+    }
+
+    $versionLine = @($trimmed -split "`r?`n" |
+        Where-Object { $_ -match '^\d+\.\d+\.\d+' } |
+        Select-Object -First 1)
+
+    if ($versionLine.Count -eq 0) {
+        throw [CoverageException]::new("'dotnet --version' no devolvió una versión válida:`n$trimmed", 1)
+    }
+
+    return $versionLine[0].Trim()
+}
+
+function Test-DotNetSdk {
+    Write-Step 'Comprobación del SDK de .NET'
+    $script:SdkVersion = Get-DotNetSdkVersion
+    Write-Ok "SDK de .NET: $script:SdkVersion"
 }
 
 # ---------------------------------------------------------------------------
@@ -950,7 +1391,9 @@ function New-CoverletTargetArguments {
         [Parameter(Mandatory = $true)][string]$ProjectPath,
         [Parameter(Mandatory = $true)][string]$Configuration,
         [string]$Framework,
-        [string]$Filter
+        [string]$Filter,
+        [string]$TrxFileName,
+        [string]$ResultsDirectory
     )
 
     if ($ProjectPath.Contains('"')) {
@@ -971,6 +1414,16 @@ function New-CoverletTargetArguments {
         $arguments += ' --filter "' + $Filter + '"'
     }
 
+    if (-not [string]::IsNullOrWhiteSpace($TrxFileName) -and
+        -not [string]::IsNullOrWhiteSpace($ResultsDirectory)) {
+        if ($ResultsDirectory.Contains('"')) {
+            throw [CoverageException]::new('La ruta de logs no puede contener comillas dobles.', 1)
+        }
+
+        $arguments += ' --logger "trx;LogFileName=' + $TrxFileName + '"'
+        $arguments += ' --results-directory "' + $ResultsDirectory + '"'
+    }
+
     return $arguments
 }
 
@@ -979,14 +1432,26 @@ function Invoke-CoverageForProject {
         [Parameter(Mandatory = $true)]$Project,
         [Parameter(Mandatory = $true)][string]$TargetPath,
         [string]$Framework,
-        [Parameter(Mandatory = $true)][string]$OutputFile
+        [Parameter(Mandatory = $true)][string]$OutputFile,
+        [Parameter(Mandatory = $true)][string]$LogDirectory,
+        [Parameter(Mandatory = $true)][string]$JobName
     )
+
+    if (-not (Test-Path -LiteralPath $LogDirectory -PathType Container)) {
+        New-Item -ItemType Directory -Path $LogDirectory -Force | Out-Null
+    }
+
+    $logPath = Join-Path $LogDirectory ($JobName + '.log')
+    $trxFileName = $JobName + '.trx'
+    $trxPath = Join-Path $LogDirectory $trxFileName
 
     $targetArguments = New-CoverletTargetArguments `
         -ProjectPath $Project.Path `
         -Configuration $script:ConfigurationValue `
         -Framework $Framework `
-        -Filter $script:FilterValue
+        -Filter $script:FilterValue `
+        -TrxFileName $trxFileName `
+        -ResultsDirectory $LogDirectory
 
     $arguments = @(
         $TargetPath
@@ -1013,32 +1478,102 @@ function Invoke-CoverageForProject {
         }
     }
 
-    Write-Detail "coverlet $($Project.Name)"
-    & $script:CoverletPath @arguments | Out-Host
-    $exitCode = $LASTEXITCODE
+    $result = Invoke-CapturedTool -FilePath $script:CoverletPath -Arguments $arguments -LogPath $logPath
+    $exitCode = $result.ExitCode
 
-    $isTestFailure = ($exitCode -in @(1, 3))
+    $failedTests = @(Get-FailedTestsFromTrx -TrxPath $trxPath)
+    $testCounts = Get-TestResultCounts -TrxPath $trxPath
+    $noTestsMatched = Test-NoTestsMatchedOutput -Lines $result.Lines
+    $hasTrx = Test-Path -LiteralPath $trxPath -PathType Leaf
+
+    # The TRX is the reliable source for test failures. The coverlet exit code
+    # alone is ambiguous: instrumentation errors and test failures can share it.
+    $isTestFailure = ($failedTests.Count -gt 0)
+    if (-not $isTestFailure -and $exitCode -ne 0 -and -not $hasTrx) {
+        $failedTests = @(Get-FailedTestsFromOutput -Lines $result.Lines)
+        $isTestFailure = ($failedTests.Count -gt 0) -or $noTestsMatched
+    }
+
     $isToolError = ($exitCode -ne 0 -and -not $isTestFailure)
 
     return [pscustomobject]@{
-        Project       = $Project
-        Framework     = $Framework
-        ExitCode      = $exitCode
-        IsTestFailure = $isTestFailure
-        IsToolError   = $isToolError
-        CoverageFile  = $OutputFile
+        Project        = $Project
+        Framework      = $Framework
+        ExitCode       = $exitCode
+        IsTestFailure  = $isTestFailure
+        IsToolError    = $isToolError
+        NoTestsMatched = $noTestsMatched
+        FailedTests    = $failedTests
+        TestCounts     = $testCounts
+        CoverageFile   = $OutputFile
+        LogPath        = $logPath
+        TrxPath        = $trxPath
+    }
+}
+
+function Test-SdkSupportsSlnx {
+    if ([string]::IsNullOrWhiteSpace($script:SdkVersion)) { return $true }
+
+    $cleanVersion = ($script:SdkVersion -split '-')[0]
+    try {
+        return ([version]$cleanVersion -ge [version]'9.0.200')
+    }
+    catch {
+        return $true
     }
 }
 
 function Build-Solution {
-    param([Parameter(Mandatory = $true)]$SolutionInfo)
+    param(
+        [Parameter(Mandatory = $true)]$SolutionInfo,
+        [Parameter(Mandatory = $true)][string[]]$ProjectPaths,
+        [Parameter(Mandatory = $true)][string]$LogDirectory
+    )
 
     Write-Step "Compilando la solución ($script:ConfigurationValue)"
 
-    & dotnet build $SolutionInfo.Path -c $script:ConfigurationValue --nologo
-    if ($LASTEXITCODE -ne 0) {
+    if (-not (Test-Path -LiteralPath $LogDirectory -PathType Container)) {
+        New-Item -ItemType Directory -Path $LogDirectory -Force | Out-Null
+    }
+
+    if ($SolutionInfo.Extension -eq '.slnx' -and -not (Test-SdkSupportsSlnx)) {
+        Write-Warn "El SDK $script:SdkVersion no soporta compilar .slnx directamente."
+        Write-Info 'Se compilarán los proyectos de la solución individualmente.'
+
+        $projectIndex = 0
+        foreach ($projectPath in $ProjectPaths) {
+            $projectIndex++
+            $projectName = [System.IO.Path]::GetFileNameWithoutExtension($projectPath)
+            $projectLog = Join-Path $LogDirectory (
+                'build-{0:D2}-{1}.log' -f $projectIndex, (ConvertTo-SafeFileName -Value $projectName)
+            )
+
+            $result = Invoke-CapturedTool -FilePath 'dotnet' `
+                -Arguments @('build', $projectPath, '-c', $script:ConfigurationValue, '--nologo') `
+                -LogPath $projectLog
+
+            if ($result.ExitCode -ne 0) {
+                throw [CoverageException]::new(
+                    "La compilación de '$projectName' falló (código $($result.ExitCode)).`n" +
+                    "         Log completo: $projectLog",
+                    1
+                )
+            }
+        }
+
+        Write-Ok 'Compilación completada.'
+        return
+    }
+
+    $buildLog = Join-Path $LogDirectory 'build.log'
+    $result = Invoke-CapturedTool -FilePath 'dotnet' `
+        -Arguments @('build', $SolutionInfo.Path, '-c', $script:ConfigurationValue, '--nologo') `
+        -LogPath $buildLog
+
+    if ($result.ExitCode -ne 0) {
         throw [CoverageException]::new(
-            "La compilación falló con código $($LASTEXITCODE). Corrige los errores y vuelve a intentarlo.",
+            "La compilación falló (código $($result.ExitCode)).`n" +
+            "         Log completo: $buildLog",
             1
         )
     }
@@ -1057,6 +1592,7 @@ function New-CoverageReport {
         [Parameter(Mandatory = $true)][string]$ReportTypes,
         [Parameter(Mandatory = $true)][string]$SourceDirectory,
         [Parameter(Mandatory = $true)][string]$HistoryDirectory,
+        [Parameter(Mandatory = $true)][string]$LogDirectory,
         [bool]$UseHistory = $true
     )
 
@@ -1072,10 +1608,13 @@ function New-CoverageReport {
         $arguments += "-historydir:$HistoryDirectory"
     }
 
-    & $script:ReportGeneratorPath @arguments
-    if ($LASTEXITCODE -ne 0) {
+    $reportLog = Join-Path $LogDirectory 'reportgenerator.log'
+    $result = Invoke-CapturedTool -FilePath $script:ReportGeneratorPath -Arguments $arguments -LogPath $reportLog
+
+    if ($result.ExitCode -ne 0) {
         throw [CoverageException]::new(
-            "ReportGenerator falló con código $($LASTEXITCODE). Revisa los archivos de cobertura intermedios.",
+            "ReportGenerator falló (código $($result.ExitCode)).`n" +
+            "         Log completo: $reportLog",
             1
         )
     }
@@ -1278,27 +1817,59 @@ function Invoke-Main {
     $startedAt = Get-Date
     Write-Banner
 
-    Test-CoverageTools
-
     Write-Step 'Búsqueda de la solución'
     $solutionInfo = Resolve-SolutionInfo -SolutionArgument $Solution
     Write-Ok "Solución: $($solutionInfo.Path)"
     Write-Info "Configuración: $script:ConfigurationValue"
 
-    $projectPaths = @(Get-SolutionProjects -SolutionInfo $solutionInfo)
+    # Resolve user-relative paths before changing the working directory.
+    $outputDirectory = Get-OutputDirectory -OutputArgument $Output -SolutionRoot $solutionInfo.Root
+    $testProjectArguments = @($TestProject |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        ForEach-Object { Resolve-UserPath -Path $_ })
+
+    # The .NET SDK is selected from the working directory, not from the
+    # solution path, so every dotnet call runs inside the solution directory.
+    Push-Location -LiteralPath $solutionInfo.Directory
+    try {
+        Invoke-MainInSolution `
+            -SolutionInfo $solutionInfo `
+            -OutputDirectory $outputDirectory `
+            -TestProjectArguments $testProjectArguments `
+            -StartedAt $startedAt
+    }
+    finally {
+        Pop-Location
+    }
+}
+
+function Invoke-MainInSolution {
+    param(
+        [Parameter(Mandatory = $true)]$SolutionInfo,
+        [Parameter(Mandatory = $true)][string]$OutputDirectory,
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [string[]]$TestProjectArguments,
+        [Parameter(Mandatory = $true)][datetime]$StartedAt
+    )
+
+    Test-DotNetSdk
+    Test-CoverageTools
+
+    $projectPaths = @(Get-SolutionProjects -SolutionInfo $SolutionInfo)
     Write-Info "$($projectPaths.Count) proyecto(s) en la solución."
 
     Write-Step 'Detección de proyectos de test'
 
-    if ($null -ne $TestProject -and $TestProject.Count -gt 0) {
-        $testProjects = @(Resolve-TestProjectArguments -Values $TestProject)
+    if ($TestProjectArguments.Count -gt 0) {
+        $testProjects = @(Resolve-TestProjectArguments -Values $TestProjectArguments)
         Write-Info 'Se usarán los proyectos indicados con -TestProject.'
         foreach ($project in $testProjects) {
             Write-Ok "$($project.Name) [$($project.TargetFrameworks -join ', ')]"
         }
     }
     else {
-        $testProjects = @(Get-TestProjects -ProjectPaths $projectPaths -SolutionRoot $solutionInfo.Root)
+        $testProjects = @(Get-TestProjects -ProjectPaths $projectPaths -SolutionRoot $SolutionInfo.Root)
     }
 
     if ($testProjects.Count -eq 0) {
@@ -1310,23 +1881,25 @@ function Invoke-Main {
     }
 
     Write-Step 'Preparación de la carpeta de salida'
-    $outputDirectory = Get-OutputDirectory -OutputArgument $Output -SolutionRoot $solutionInfo.Root
     Initialize-OutputDirectory `
-        -OutputPath $outputDirectory `
-        -SolutionRoot $solutionInfo.Root `
+        -OutputPath $OutputDirectory `
+        -SolutionRoot $SolutionInfo.Root `
         -KeepHistory (-not $script:NoHistoryValue)
-    Write-Ok "Salida: $outputDirectory"
-    Show-GitIgnoreWarning -OutputPath $outputDirectory
+    Write-Ok "Salida: $OutputDirectory"
+    Show-GitIgnoreWarning -OutputPath $OutputDirectory
+
+    $logDirectory = Join-Path $OutputDirectory 'logs'
+    New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
 
     if (-not $NoBuild) {
-        Build-Solution -SolutionInfo $solutionInfo
+        Build-Solution -SolutionInfo $SolutionInfo -ProjectPaths $projectPaths -LogDirectory $logDirectory
     }
     else {
         Write-Warn 'Se omite la compilación (-NoBuild). Se usará la DLL existente.'
     }
 
     if ($script:KeepRawValue) {
-        $rawDirectory = Join-Path $outputDirectory 'raw'
+        $rawDirectory = Join-Path $OutputDirectory 'raw'
         New-Item -ItemType Directory -Path $rawDirectory -Force | Out-Null
     }
     else {
@@ -1364,28 +1937,56 @@ function Invoke-Main {
                 -Project $project `
                 -TargetPath $targetPath `
                 -Framework $framework `
-                -OutputFile $coverageFile
+                -OutputFile $coverageFile `
+                -LogDirectory $logDirectory `
+                -JobName $baseName
 
-            if ($result.ExitCode -eq 0) {
+            if ($result.ExitCode -eq 0 -and -not $result.IsTestFailure) {
                 if (-not (Test-Path -LiteralPath $coverageFile -PathType Leaf)) {
                     throw [CoverageException]::new(
-                        "coverlet terminó correctamente pero no generó el archivo de cobertura para $label.",
+                        "coverlet terminó correctamente pero no generó el archivo de cobertura para $label. " +
+                        "Log: $($result.LogPath)",
                         1
                     )
                 }
 
                 $coverageFiles.Add($coverageFile)
-                Write-Ok "Cobertura recogida: $([System.IO.Path]::GetFileName($coverageFile))"
+
+                if ($null -eq $result.TestCounts -or $result.TestCounts.Total -eq 0) {
+                    if (-not [string]::IsNullOrWhiteSpace($script:FilterValue)) {
+                        throw [CoverageException]::new(
+                            "El filtro '$($script:FilterValue)' no coincide con ningún test en $label. " +
+                            "Log: $($result.LogPath)",
+                            1
+                        )
+                    }
+
+                    Write-Warn "No se ejecutó ningún test en $label. Log: $($result.LogPath)"
+                    $testsText = 'Sin tests ejecutados. Cobertura recogida.'
+                }
+                else {
+                    $passedCount = $result.TestCounts.Passed
+                    $testsLabel = if ($passedCount -eq 1) { 'test pasado' } else { 'tests pasados' }
+                    $testsText = "$passedCount $testsLabel. Cobertura recogida."
+
+                    if ($result.TestCounts.Skipped -gt 0) {
+                        $skippedCount = $result.TestCounts.Skipped
+                        $skippedLabel = if ($skippedCount -eq 1) { 'omitido' } else { 'omitidos' }
+                        $testsText = "$passedCount $testsLabel, $skippedCount $skippedLabel. Cobertura recogida."
+                    }
+                }
+
+                Write-Ok $testsText
             }
             elseif ($result.IsTestFailure) {
                 $failures.Add([pscustomobject]@{
-                    Project   = $project.Name
-                    Path      = $project.Path
-                    Framework = $framework
-                    ExitCode  = $result.ExitCode
+                    Project        = $project.Name
+                    Framework      = $framework
+                    ExitCode       = $result.ExitCode
+                    FailedTests    = @($result.FailedTests)
+                    NoTestsMatched = [bool]$result.NoTestsMatched
+                    LogPath        = $result.LogPath
                 })
-
-                Write-Warn "Los tests fallaron en $label (código $($result.ExitCode))."
 
                 if (Test-Path -LiteralPath $coverageFile -PathType Leaf) {
                     $coverageFiles.Add($coverageFile)
@@ -1393,8 +1994,8 @@ function Invoke-Main {
             }
             else {
                 throw [CoverageException]::new(
-                    "coverlet falló en $label con código $($result.ExitCode). " +
-                    'Revisa la salida anterior; si es 101, suele tratarse de un problema de instrumentación.',
+                    "coverlet falló en $label (código $($result.ExitCode)).`n" +
+                    "         Log completo: $($result.LogPath)",
                     1
                 )
             }
@@ -1404,13 +2005,36 @@ function Invoke-Main {
     if ($failures.Count -gt 0) {
         Write-Host ''
         Write-Err 'Tests fallidos:'
+
         foreach ($failure in $failures) {
             $frameworkText = ''
             if (-not [string]::IsNullOrWhiteSpace($failure.Framework)) {
                 $frameworkText = " [$($failure.Framework)]"
             }
 
-            Write-Host ("         - {0}{1}: {2}" -f $failure.Project, $frameworkText, $failure.Path) -ForegroundColor Red
+            Write-Host ("         - {0}{1}" -f $failure.Project, $frameworkText) -ForegroundColor Red
+
+            if ($failure.NoTestsMatched) {
+                Write-Host '           Ningún test coincide con el filtro indicado.' -ForegroundColor Yellow
+            }
+            elseif (@($failure.FailedTests).Count -gt 0) {
+                $maxTests = 20
+                $shownTests = @($failure.FailedTests | Select-Object -First $maxTests)
+
+                foreach ($testName in $shownTests) {
+                    Write-Host "           - $testName" -ForegroundColor Red
+                }
+
+                $remainingTests = @($failure.FailedTests).Count - $shownTests.Count
+                if ($remainingTests -gt 0) {
+                    Write-Host "           ... y $remainingTests más (ver log)" -ForegroundColor DarkGray
+                }
+            }
+            else {
+                Write-Host '           No se pudieron identificar los nombres de los tests fallidos.' -ForegroundColor Yellow
+            }
+
+            Write-Host "           Log: $($failure.LogPath)" -ForegroundColor DarkGray
         }
 
         if (-not $script:ForceValue) {
@@ -1432,18 +2056,19 @@ function Invoke-Main {
         Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
         Select-Object -Unique) -join ';'
 
-    $historyDirectory = Join-Path $outputDirectory 'history'
+    $historyDirectory = Join-Path $OutputDirectory 'history'
     New-CoverageReport `
         -CoverageFiles $coverageFiles.ToArray() `
-        -TargetDirectory $outputDirectory `
+        -TargetDirectory $OutputDirectory `
         -ReportTypes $reportTypes `
-        -SourceDirectory $solutionInfo.Root `
+        -SourceDirectory $SolutionInfo.Root `
         -HistoryDirectory $historyDirectory `
+        -LogDirectory $logDirectory `
         -UseHistory (-not $script:NoHistoryValue)
 
-    Write-Ok "Reporte generado en $outputDirectory"
+    Write-Ok "Reporte generado en $OutputDirectory"
 
-    $summaryPath = Join-Path $outputDirectory 'Summary.json'
+    $summaryPath = Join-Path $OutputDirectory 'Summary.json'
     $summary = Get-CoverageSummary -SummaryPath $summaryPath
     Show-CoverageSummary -Summary $summary
 
@@ -1455,15 +2080,15 @@ function Invoke-Main {
     }
 
     if (-not $script:NoOpenValue) {
-        $indexPath = Join-Path $outputDirectory 'index.html'
+        $indexPath = Join-Path $OutputDirectory 'index.html'
         Open-Report -IndexPath $indexPath
     }
 
-    $elapsed = (Get-Date) - $startedAt
+    $elapsed = (Get-Date) - $StartedAt
     Write-Host ''
     Write-Host '  ------------------------------------------------------------' -ForegroundColor DarkCyan
     Write-Host ("   Listo en {0:N1} s." -f $elapsed.TotalSeconds) -ForegroundColor Green
-    Write-Host ("   Reporte: {0}" -f $outputDirectory) -ForegroundColor White
+    Write-Host ("   Reporte: {0}" -f $OutputDirectory) -ForegroundColor White
     Write-Host '  ------------------------------------------------------------' -ForegroundColor DarkCyan
     Write-Host ''
 

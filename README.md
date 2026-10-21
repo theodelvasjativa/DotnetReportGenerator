@@ -14,7 +14,7 @@ Un comando. Detecta la solución, encuentra los tests, compila una vez, mide la 
 
 ## ✨ Qué hace
 
-- 🔍 **Autodetecta** la solución (`.sln` y `.slnx`) subiendo por los directorios padre hasta la raíz del repositorio git.
+- 🔍 **Autodetecta** la solución (`.sln` y `.slnx`) subiendo por los directorios padre hasta la raíz del repositorio git. Los `.slnx` se leen con un **parser XML nativo**, sin depender de `dotnet sln list`.
 - 🧪 **Detecta los proyectos de test** con `IsTestProject` y, como respaldo, por la referencia a `Microsoft.NET.Test.Sdk`.
 - 🧩 **Soporta multi-target**: ejecuta una pasada por cada TFM, o solo la indicada con `-Framework`.
 - 📦 **Compila una sola vez** la solución y mide cada proyecto con `coverlet … --no-build`.
@@ -24,7 +24,7 @@ Un comando. Detecta la solución, encuentra los tests, compila una vez, mide la 
 - 🕘 **Historial de tendencias** entre ejecuciones, salvo con `-NoHistory`.
 - 🌐 **Abre el `index.html`** en el navegador, también en WSL.
 - 🧹 **Limpia la salida** en cada ejecución, conservando `history`.
-- 🛡️ **Comprueba herramientas y rutas** antes de empezar y avisa de problemas de `.gitignore`.
+- 🛡️ **Comprueba herramientas y rutas** antes de empezar, avisa de problemas de `.gitignore` y no vacía carpetas con archivos ajenos sin confirmación.
 
 ---
 
@@ -34,6 +34,7 @@ Un comando. Detecta la solución, encuentra los tests, compila una vez, mide la 
 |---|---|
 | PowerShell | **7.0 o superior** (`pwsh`). Windows PowerShell 5.1 no es compatible. |
 | .NET SDK | **8.0 o superior** (se usa `dotnet msbuild -getProperty`). |
+| `.slnx` | Soporte nativo mediante parser XML. Para **compilar** `.slnx` se requiere SDK 9.0.200+; con versiones anteriores el script compila los proyectos individualmente. |
 | Herramientas | `coverlet.console` y `dotnet-reportgenerator-globaltool`. El instalador las instala. |
 | Git | Opcional. Se usa para la búsqueda de la raíz del repositorio y el aviso de `.gitignore`. |
 | Navegador | Opcional, para abrir el reporte. Usa `-NoOpen` en CI. |
@@ -164,12 +165,16 @@ Salida típica:
    coverlet.console + ReportGenerator
   ============================================================
 
+==> Búsqueda de la solución
+    [OK] Solución: /ruta/al/repo/MiApp.slnx
+    Configuración: Debug
+
+==> Comprobación del SDK de .NET
+    [OK] SDK de .NET: 10.0.113
+
 ==> Comprobación de herramientas
     [OK] coverlet: /home/tu-usuario/.dotnet/tools/coverlet
     [OK] reportgenerator: /home/tu-usuario/.dotnet/tools/reportgenerator
-
-==> Búsqueda de la solución
-    [OK] Solución: /ruta/al/repo/MiApp.slnx
 
 ==> Detección de proyectos de test
     [OK] MiApp.Tests [net8.0]
@@ -178,7 +183,7 @@ Salida típica:
     [OK] Compilación completada.
 
 ==> Midiendo cobertura: MiApp.Tests [net8.0]
-    [OK] Cobertura recogida: 001-MiApp.Tests-net8.0.cobertura.xml
+    [OK] 42 tests pasados. Cobertura recogida.
 
 ==> Generando el reporte
     [OK] Reporte generado en /ruta/al/repo/coverage-report
@@ -194,6 +199,55 @@ Salida típica:
 
 ---
 
+## 🖥️ Salida en consola y logs
+
+Por defecto **no se muestra la salida de `dotnet build`, `dotnet test`, `coverlet` ni `ReportGenerator`**. Solo aparecen los mensajes propios de la herramienta.
+
+### Si falla la compilación
+
+```text
+==> Compilando la solución (Debug)
+
+    [ERROR] La compilación falló (código 1).
+         Log completo: /ruta/coverage-report/logs/build.log
+```
+
+### Si fallan tests
+
+```text
+    [ERROR] Tests fallidos:
+         - MiApp.Tests [net8.0]
+           - MiApp.Tests.CalculatorTests.Add_ReturnsSum
+           - MiApp.Tests.CalculatorTests.IsPositive_ReturnsExpected(value: -1, expected: False)
+           Log: /ruta/coverage-report/logs/001-MiApp.Tests-net8.0.log
+```
+
+El nombre de cada test se obtiene del archivo TRX que genera `dotnet test`, no de parsear texto libre.
+
+### Logs completos
+
+Todo el detalle queda en:
+
+```text
+<salida>/logs/
+├── build.log
+├── 001-MiApp.Tests-net8.0.log
+├── 001-MiApp.Tests-net8.0.trx
+└── reportgenerator.log
+```
+
+Los logs se regeneran en cada ejecución. En caso de fallo, la ruta del log correspondiente se muestra en el mensaje.
+
+### Ver todo de nuevo
+
+```powershell
+generateCodeCoverageReport -Verbose
+```
+
+Con `-Verbose` se muestra íntegra la salida de las herramientas, como antes.
+
+---
+
 ## ⚙️ Parámetros
 
 ```powershell
@@ -203,11 +257,11 @@ Get-Help ./generateCodeCoverageReport.ps1 -Full
 | Parámetro | Tipo | Defecto | Descripción |
 |---|---|---|---|
 | `-Solution` | `string` | autodetección | Ruta al `.sln`/`.slnx` o a la carpeta que lo contiene. |
-| `-TestProject` | `string[]` | todos los de test | Uno o varios `.csproj` de test (o carpetas). Ignora la autodetección. |
+| `-TestProject` | `string[]` | todos los de test | Uno o varios `.csproj`/`.fsproj`/`.vbproj` de test (o carpetas). Ignora la autodetección. |
 | `-Output` | `string` | `<raíz solución>/coverage-report` | Carpeta de salida del reporte. |
 | `-Configuration` | `string` | `Debug` | Configuración de compilación. |
 | `-Framework` | `string` | todos | TFM concreto para proyectos multi-target. |
-| `-Filter` | `string` | — | Filtro para `dotnet test --filter`. |
+| `-Filter` | `string` | — | Filtro para `dotnet test --filter`. Si no coincide con ningún test, el script termina con código 1. |
 | `-Formats` | `string[]` | `Html, TextSummary, Cobertura` | Tipos de reporte de ReportGenerator. |
 | `-Exclude` | `string[]` | `[*.Tests]*`, `[*.Test]*`, `[*.UnitTests]*`, `[*.IntegrationTests]*` | Filtros de exclusión de coverlet. |
 | `-ExcludeByFile` | `string[]` | `**/Migrations/*.cs`, `**/*.g.cs`, `**/*.Designer.cs` | Archivos excluidos de la cobertura. |
@@ -218,6 +272,7 @@ Get-Help ./generateCodeCoverageReport.ps1 -Full
 | `-NoHistory` | `switch` | — | No guarda ni usa historial. |
 | `-Force` | `switch` | — | Genera el reporte aunque fallen los tests. |
 | `-KeepRaw` | `switch` | — | Conserva los XML intermedios en `<salida>/raw`. |
+| `-Verbose` | `switch` común | — | Muestra la salida completa de `dotnet`, `coverlet` y `ReportGenerator`. |
 
 > `JsonSummary` se añade siempre internamente para calcular el resumen y el umbral globales. No se usa `--threshold` de coverlet porque se aplica por proyecto, no al total.
 
@@ -275,6 +330,12 @@ generateCodeCoverageReport `
 generateCodeCoverageReport -NoBuild -KeepRaw
 ```
 
+### Ver todo el detalle de las herramientas
+
+```powershell
+generateCodeCoverageReport -Verbose
+```
+
 ### Reporte solo de texto
 
 ```powershell
@@ -286,20 +347,22 @@ generateCodeCoverageReport -Formats TextSummary -NoOpen
 ## 🔄 Cómo funciona por dentro
 
 ```text
- 1. Comprobar coverlet y reportgenerator
+ 1. Buscar la solución (.sln / .slnx)
               │
- 2. Buscar la solución (.sln / .slnx)
+ 2. Comprobar el SDK de .NET, coverlet y reportgenerator
+    (desde la carpeta de la solución, respetando su global.json)
               │
- 3. Detectar proyectos de test (IsTestProject / Test.Sdk)
+ 3. Leer sus proyectos (XML nativo para .slnx) y detectar los de test
               │
- 4. Preparar la salida (conservar history, comprobar .gitignore)
+ 4. Preparar la salida y los logs (conservar history, comprobar .gitignore)
               │
- 5. dotnet build <solución> -c <configuración>
+ 5. dotnet build <solución> -c <configuración>   [salida capturada → logs/build.log]
               │
  6. Por cada proyecto de test y TFM:
        coverlet <dll> --target dotnet \
-         --targetargs "test <proj> --no-build -c <cfg>" \
+         --targetargs "test <proj> --no-build -c <cfg> --logger trx" \
          --format cobertura
+       [salida capturada → logs/]
               │
  7. reportgenerator -reports:<todos> -targetdir:<salida> \
        -historydir:<salida>/history
@@ -324,7 +387,7 @@ Coverlet instrumenta la DLL del proyecto de test (y los ensamblados de su carpet
 | Código | Significado |
 |---|---|
 | `0` | Éxito. |
-| `1` | Error de configuración, de solución, de compilación o de herramientas. |
+| `1` | Error de configuración, de solución, de compilación, de herramientas, o filtro de tests sin coincidencias. |
 | `2` | Tests fallidos (sin `-Force`). |
 | `3` | Umbral de cobertura no alcanzado. |
 
@@ -348,7 +411,7 @@ La primera vez, el script comprueba si la carpeta de salida está dentro de un r
 coverage-report/
 ```
 
-> La carpeta de salida se limpia antes de cada ejecución, **excepto** `history`. Con `-KeepRaw`, los XML quedan en `<salida>/raw`, pero también se eliminan en la siguiente ejecución. Usa una carpeta dedicada: el script rechaza rutas que contengan la solución o el directorio actual para no borrar código fuente.
+> La carpeta de salida se limpia antes de cada ejecución, **excepto** `history`. Con `-KeepRaw`, los XML quedan en `<salida>/raw`, pero también se eliminan en la siguiente ejecución. Usa una carpeta dedicada: además de rechazar rutas que contengan la solución o el directorio actual, el script solo vacía carpetas que parezcan de un reporte anterior (sus archivos o el marcador `.coverage-report`). Si encuentra archivos ajenos, pide confirmación; en modo no interactivo (CI) se detiene con código 1 sin borrar nada.
 
 ---
 
@@ -423,6 +486,8 @@ Elimina:
 - los shims/wrappers;
 - la carpeta de instalación;
 - las entradas de `PATH` y de `.bashrc`/`.zshrc` que añadió el instalador.
+
+Si las herramientas globales se conservan (opción por defecto), la entrada de `~/.dotnet/tools` en el `PATH` también se conserva para que `coverlet` y `reportgenerator` sigan funcionando. Si se desinstalan con `-UninstallTools`, se elimina además esa entrada.
 
 Pregunta si quieres desinstalar también `coverlet.console` y `reportgenerator`; **por defecto no lo hace**.
 
@@ -506,16 +571,55 @@ Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
 
 Se ejecuta una pasada por cada TFM. Cada uno necesita su **runtime** instalado, aunque el SDK sea más nuevo. Por ejemplo, un proyecto `net8.0;net10.0` requiere el runtime de .NET 8 y el de .NET 10. Usa `-Framework net10.0` para limitar la ejecución.
 
-### `.slnx` no soportado
+### Problemas con `.slnx`
 
-`dotnet sln list` necesita un SDK que entienda `.slnx` (**.NET SDK 9.0.200 o superior**). Si tu SDK no lo soporta, el script lo indica. Usa un `.sln` clásico o actualiza el SDK.
+El script lee el XML de la solución directamente (`<Project Path="..."/>`), por lo que **no depende de `dotnet sln list`**. Soporta proyectos anidados en `<Folder>` y rutas con `/` o `\`.
+
+Para **compilar** `.slnx` se necesita .NET SDK 9.0.200 o superior. Si el SDK es anterior, el script compila los proyectos de la solución individualmente y continúa.
+
+Si el XML está mal formado o referencia un proyecto que no existe, el mensaje indica la ruta exacta.
+
+### `Requested SDK version ... global.json`
+
+Si al ejecutar aparece algo como:
+
+```text
+A compatible .NET SDK was not found.
+Requested SDK version: 10.0.401
+global.json file: /ruta/al/repo/global.json
+```
+
+el repositorio está fijando una versión de SDK que no tienes instalada. Comprueba:
+
+```bash
+dotnet --list-sdks
+cat global.json
+```
+
+Instala la versión solicitada desde <https://dotnet.microsoft.com/download> o ajusta `global.json` (si el equipo lo permite). **El script no modifica `global.json`** y no intenta sortearlo.
 
 ### Tests fallidos
 
-El script no genera el reporte y sale con `2`. Corrige los tests o usa `-Force`:
+El script no genera el reporte y sale con `2`. Muestra el proyecto, el TFM y los nombres de los tests fallidos; el detalle completo queda en `<salida>/logs/`. Corrige los tests o usa `-Force`:
 
 ```powershell
 generateCodeCoverageReport -Force
+```
+
+### El filtro no coincide con ningún test
+
+Si usas `-Filter` y no se ejecuta ningún test, el script sale con `1` en lugar de generar un reporte al 0 %:
+
+```text
+[ERROR] El filtro 'FullyQualifiedName~Checkout' no coincide con ningún test en MiApp.Tests [net8.0].
+```
+
+Revisa la sintaxis del filtro o ejecuta sin `-Filter` para comprobar que los tests se detectan.
+
+### Ver la salida completa para depurar
+
+```powershell
+generateCodeCoverageReport -Verbose
 ```
 
 ### El umbral falla pero quiero el reporte igualmente
@@ -546,10 +650,35 @@ pwsh ./install.ps1 -UpdateTools
 
 ```text
 DotnetReportGenerator/
-├── install.ps1                        # Instalador y desinstalador
-├── generateCodeCoverageReport.ps1     # Script principal
+├── .github/workflows/ci.yml            # Integración continua
+├── tests/
+│   ├── ScriptQuality.Tests.ps1         # Parseo, ayuda y análisis básico
+│   ├── CoverageIntegration.Tests.ps1   # Ejecución real sobre una solución de prueba
+│   ├── Install.Tests.ps1               # Instalación, manifiesto y desinstalación
+│   └── fixture/                        # Solución .slnx mínima para las pruebas
+├── install.ps1                         # Instalador y desinstalador
+├── generateCodeCoverageReport.ps1      # Script principal
+├── .gitignore
 └── README.md
 ```
+
+---
+
+## 🧪 Desarrollo y pruebas
+
+Las pruebas usan [Pester](https://pester.dev/) y una solución de fixture con .NET 10:
+
+```powershell
+Install-Module Pester -Scope CurrentUser -Force
+
+Invoke-Pester ./tests -Output Detailed
+```
+
+- `ScriptQuality.Tests.ps1` comprueba que los scripts parsean y tienen ayuda.
+- `CoverageIntegration.Tests.ps1` compila el fixture y valida el reporte, el umbral (3), los tests fallidos (2), `-Force`, el filtro sin coincidencias (1) y la protección de la carpeta de salida.
+- `Install.Tests.ps1` instala y desinstala en un `HOME` temporal (solo Linux/macOS) y verifica el manifiesto y los bloques de `PATH`.
+
+El workflow de `.github/workflows/ci.yml` ejecuta PSScriptAnalyzer (solo errores) y toda la suite en Ubuntu. Las pruebas de integración requieren el SDK de .NET 10 porque el fixture usa `net10.0`; la herramienta en sí sigue funcionando con SDK 8 o superior.
 
 ---
 
@@ -557,12 +686,16 @@ DotnetReportGenerator/
 
 - **Modelo de instrumentación:** `coverlet.console` instrumenta la DLL del proyecto de test y los ensamblados de su carpeta de salida. Es el modelo estándar cuando los proyectos de producción se referencian con `ProjectReference`.
 - **Detección de tests:** se basa en `IsTestProject`, `Microsoft.NET.Test.Sdk` o `MSTest.Sdk`. Frameworks personalizados pueden requerir `-TestProject`.
+- **`.slnx`:** el listado de proyectos es nativo (XML), pero compilar la solución `.slnx` requiere SDK 9.0.200+; en versiones anteriores se compilan los proyectos individualmente.
+- **SDK fijado por `global.json`:** el script respeta la versión del SDK que fija el repositorio. Si no está instalada, se detiene con un mensaje claro y no modifica `global.json`.
 - **Microsoft.Testing.Platform:** proyectos configurados con MTP (por ejemplo, algunas configuraciones de xUnit v3) pueden no ser compatibles con el envolvimiento de `dotnet test` que hace `coverlet.console`. En ese caso, usa el runner de VSTest o `dotnet-coverage`.
 - **Umbral global:** es único para todo el reporte. No hay umbrales por proyecto ni por clase.
 - **Métodos:** `methodcoverage` depende del parser de ReportGenerator. Si no hay datos, se muestra `N/D` y el umbral de métodos lo trata como 0 %.
 - **Un solo nivel de solución:** no se recorren soluciones anidadas; se elige una y se miden sus proyectos.
-- **Limpieza de salida:** se borra todo excepto `history`. Usa siempre una carpeta dedicada para `-Output`.
-- **Códigos de coverlet:** `1`/`3` se interpretan como tests fallidos; `101` u otros se tratan como error de herramienta.
+- **Limpieza de salida:** se borra todo excepto `history`, y solo si la carpeta parece de un reporte propio. Usa siempre una carpeta dedicada para `-Output`.
+- **Tests fallidos:** se detectan a partir del TRX de `dotnet test`; si no hay TRX, se usa la salida de la herramienta como respaldo. Así un error de instrumentación no se confunde con un test fallido.
+- **SDK de .NET:** se resuelve desde la carpeta de la solución, por lo que se respeta el `global.json` del repositorio aunque ejecutes el comando desde otro directorio.
+- **Carpeta de salida:** se marca con `.coverage-report` para reconocer ejecuciones propias incompletas. Nunca se vacía una carpeta con archivos ajenos sin confirmación.
 - **Plataformas:** el flujo completo se ha validado en Linux. Windows y macOS usan APIs estándar de PowerShell/.NET (`SetEnvironmentVariable`, `Start-Process`, `open`, `xdg-open`), pero conviene ejecutar `install.ps1` una vez en cada sistema para validar shims y políticas.
 - **Idioma:** los mensajes de usuario están en español; el código, nombres de funciones y comentarios están en inglés.
 

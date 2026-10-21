@@ -1,0 +1,49 @@
+# Reportes de cobertura generados por generateCodeCoverageReport.ps1
+coverage-report/
+
+# Cobertura intermedia (coverlet / dotnet test / Cobertura / OpenCover)
+*.cobertura.xml
+coverage.json
+coverage.opencover.xml
+coverage.info
+TestResults/
+*.trx
+
+# Salida de compilación .NET
+bin/
+obj/
+[Dd]ebug/
+[Rr]elease/
+artifacts/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+.vs/
+
+# Herramientas y paquetes
+packages/
+*.nupkg
+.dotnet/
+.nuget/
+
+# Logs y temporales
+*.log
+logs/
+tmp/
+temp/
+
+# Entornos virtuales / dependencias (por si se añaden utilidades)
+node_modules/
+
+# Editores e IDE
+.idea/
+*.swp
+*.swo
+*~
+.vscode/
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
+desktop.ini
