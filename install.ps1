@@ -53,6 +53,10 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+class InstallException : System.Exception {
+    InstallException([string]$Message) : base($Message) {}
+}
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -330,6 +334,39 @@ function Add-ToCurrentPath {
     }
 }
 
+function Test-DirectoryWritable {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) { return $false }
+
+    $probePath = Join-Path $Path ('.write-test-' + [guid]::NewGuid().ToString('N'))
+    try {
+        [System.IO.File]::WriteAllText($probePath, '')
+        return $true
+    }
+    catch {
+        return $false
+    }
+    finally {
+        if (Test-Path -LiteralPath $probePath -PathType Leaf) {
+            Remove-Item -LiteralPath $probePath -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Get-UnixPermissionHint {
+    param([Parameter(Mandatory = $true)][string]$Directory)
+
+    $chownCommand = 'sudo chown "$USER:$USER" "' + $Directory + '"'
+    $chmodCommand = 'chmod u+w "' + $Directory + '"'
+
+    return "Causa habitual: la carpeta pertenece a otro usuario (por ejemplo, root).`n" +
+        "Solución:`n" +
+        "  $chownCommand`n" +
+        "  $chmodCommand`n`n" +
+        'Después vuelve a ejecutar: pwsh ./install.ps1'
+}
+
 function Get-ShellProfilePath {
     $shell = [System.IO.Path]::GetFileName($env:SHELL)
     $homeDirectory = Get-UserHome
@@ -545,7 +582,7 @@ function Get-InstalledGlobalTools {
     $exitCode = $LASTEXITCODE
 
     if ($exitCode -ne 0) {
-        throw "No se pudo obtener la lista de herramientas globales (dotnet tool list --global)."
+        throw [InstallException]::new("No se pudo obtener la lista de herramientas globales (dotnet tool list --global).")
     }
 
     $result = @{}
@@ -565,7 +602,7 @@ function Install-GlobalTool {
     Write-Info "Instalando $Id..."
     & dotnet tool install --global $Id
     if ($LASTEXITCODE -ne 0) {
-        throw "No se pudo instalar la herramienta global '$Id'."
+        throw [InstallException]::new("No se pudo instalar la herramienta global '$Id'.")
     }
 }
 
@@ -575,7 +612,7 @@ function Update-GlobalTool {
     Write-Info "Actualizando $Id..."
     & dotnet tool update --global $Id
     if ($LASTEXITCODE -ne 0) {
-        throw "No se pudo actualizar la herramienta global '$Id'."
+        throw [InstallException]::new("No se pudo actualizar la herramienta global '$Id'.")
     }
 }
 
@@ -700,12 +737,25 @@ function New-WindowsShim {
         [Parameter(Mandatory = $true)][string]$ScriptName
     )
 
+    if (Test-Path -LiteralPath $Path -PathType Container) {
+        throw [InstallException]::new(
+            "La ruta '$Path' es una carpeta. Elimínala o renómbrala y vuelve a ejecutar el instalador."
+        )
+    }
+
     $content = '@echo off' + "`r`n" +
         'pwsh -NoProfile -File "%~dp0' + $ScriptName + '" %*' + "`r`n" +
         'exit /b %ERRORLEVEL%' + "`r`n"
 
     $encoding = New-Object System.Text.UTF8Encoding($false)
-    [System.IO.File]::WriteAllText($Path, $content, $encoding)
+    try {
+        [System.IO.File]::WriteAllText($Path, $content, $encoding)
+    }
+    catch {
+        throw [InstallException]::new(
+            "No se pudo escribir el shim '$Path': $($_.Exception.Message)"
+        )
+    }
 }
 
 function New-UnixWrapper {
@@ -714,6 +764,12 @@ function New-UnixWrapper {
         [Parameter(Mandatory = $true)][string]$TargetScript
     )
 
+    if (Test-Path -LiteralPath $Path -PathType Container) {
+        throw [InstallException]::new(
+            "La ruta '$Path' es una carpeta. Elimínala o renómbrala y vuelve a ejecutar el instalador."
+        )
+    }
+
     $escapedTarget = $TargetScript.Replace("'", "''")
     $content = "#!/usr/bin/env pwsh`n" +
         "# Generado por install.ps1. No editar a mano.`n" +
@@ -721,11 +777,18 @@ function New-UnixWrapper {
         "exit `$LASTEXITCODE`n"
 
     $encoding = New-Object System.Text.UTF8Encoding($false)
-    [System.IO.File]::WriteAllText($Path, $content, $encoding)
+    try {
+        [System.IO.File]::WriteAllText($Path, $content, $encoding)
+    }
+    catch {
+        throw [InstallException]::new(
+            "No se pudo escribir el wrapper '$Path': $($_.Exception.Message)"
+        )
+    }
 
     & chmod +x $Path 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0) {
-        throw "No se pudo hacer ejecutable el wrapper: $Path"
+        throw [InstallException]::new("No se pudo hacer ejecutable el wrapper: $Path")
     }
 }
 
@@ -794,7 +857,23 @@ function Register-MainCommand {
     else {
         $binDirectory = Get-UnixBinDirectory
         if (-not (Test-Path -LiteralPath $binDirectory -PathType Container)) {
-            New-Item -ItemType Directory -Path $binDirectory -Force | Out-Null
+            try {
+                New-Item -ItemType Directory -Path $binDirectory -Force | Out-Null
+            }
+            catch {
+                throw [InstallException]::new(
+                    "No se pudo crear la carpeta '$binDirectory': $($_.Exception.Message)`n`n" +
+                    (Get-UnixPermissionHint -Directory $binDirectory)
+                )
+            }
+        }
+
+        if (-not (Test-DirectoryWritable -Path $binDirectory)) {
+            throw [InstallException]::new(
+                "La carpeta '$binDirectory' existe pero no es escribible por el usuario actual.`n" +
+                "No se puede crear el comando generateCodeCoverageReport allí.`n`n" +
+                (Get-UnixPermissionHint -Directory $binDirectory)
+            )
         }
 
         $wrapperPath = Join-Path $binDirectory $script:ToolName
@@ -854,7 +933,7 @@ function Register-AliasCommand {
         }
 
         if (-not $isOurs) {
-            throw "El alias '$AliasName' ya existe y pertenece a otro comando ($($existingCommand.Source)). Elige otro nombre."
+            throw [InstallException]::new("El alias '$AliasName' ya existe y pertenece a otro comando ($($existingCommand.Source)). Elige otro nombre.")
         }
     }
 
@@ -880,12 +959,31 @@ function Invoke-Install {
 
     $sourceScript = Join-Path $PSScriptRoot $script:MainScriptName
     if (-not (Test-Path -LiteralPath $sourceScript -PathType Leaf)) {
-        throw "No se encontró '$($script:MainScriptName)' junto a install.ps1. Descarga el repositorio completo."
+        throw [InstallException]::new("No se encontró '$($script:MainScriptName)' junto a install.ps1. Descarga el repositorio completo.")
     }
 
     $installDirectory = Get-InstallDirectory
     if (-not (Test-Path -LiteralPath $installDirectory -PathType Container)) {
-        New-Item -ItemType Directory -Path $installDirectory -Force | Out-Null
+        try {
+            New-Item -ItemType Directory -Path $installDirectory -Force | Out-Null
+        }
+        catch {
+            throw [InstallException]::new(
+                "No se pudo crear la carpeta de instalación '$installDirectory': $($_.Exception.Message)"
+            )
+        }
+    }
+
+    if (-not (Test-DirectoryWritable -Path $installDirectory)) {
+        $hint = ''
+        if (-not (Test-WindowsPlatform)) {
+            $hint = "`n`n" + (Get-UnixPermissionHint -Directory $installDirectory)
+        }
+
+        throw [InstallException]::new(
+            "La carpeta de instalación '$installDirectory' no es escribible por el usuario actual." +
+            " Revisa sus permisos y vuelve a ejecutar el instalador." + $hint
+        )
     }
 
     $manifestPath = Get-ManifestPath -InstallDirectory $installDirectory
@@ -893,6 +991,12 @@ function Invoke-Install {
     $previousAlias = [string](Get-ObjectProperty -Object $previousManifest -Name 'alias' -Default '')
 
     $destinationScript = Join-Path $installDirectory $script:MainScriptName
+    if (Test-Path -LiteralPath $destinationScript -PathType Container) {
+        throw [InstallException]::new(
+            "La ruta '$destinationScript' es una carpeta. Elimínala o renómbrala y vuelve a ejecutar el instalador."
+        )
+    }
+
     $scriptChanged = $true
     if (Test-Path -LiteralPath $destinationScript -PathType Leaf) {
         $sourceHash = (Get-FileHash -LiteralPath $sourceScript -Algorithm SHA256).Hash
@@ -900,7 +1004,14 @@ function Invoke-Install {
         $scriptChanged = ($sourceHash -ne $destinationHash)
     }
 
-    Copy-Item -LiteralPath $sourceScript -Destination $destinationScript -Force
+    try {
+        Copy-Item -LiteralPath $sourceScript -Destination $destinationScript -Force
+    }
+    catch {
+        throw [InstallException]::new(
+            "No se pudo copiar el script a '$destinationScript': $($_.Exception.Message)"
+        )
+    }
 
     if ($scriptChanged) {
         Add-Installed $script:MainScriptName
@@ -1164,6 +1275,11 @@ try {
         Invoke-Install
         Show-Summary
     }
+}
+catch [InstallException] {
+    Write-Host ''
+    Write-Err $_.Exception.Message
+    exit 1
 }
 catch {
     Write-Host ''

@@ -466,6 +466,26 @@ El script también busca las herramientas en esa carpeta aunque el `PATH` de la 
 - Windows: comprueba el `PATH` del usuario y que existe `%LOCALAPPDATA%\CodeCoverageReport\generateCodeCoverageReport.cmd`.
 - Ejecuta `pwsh ./install.ps1` de nuevo: es idempotente.
 
+### `Access to the path ... is denied` al crear el wrapper
+
+En Linux/macOS, el instalador necesita escribir en `~/.local/bin`. Si esa carpeta pertenece a `root` (por ejemplo, porque se creó ejecutando algo con `sudo`), el wrapper no se puede crear.
+
+Comprueba el propietario:
+
+```bash
+ls -ld ~/.local/bin
+```
+
+Si aparece `root root`, cambia el propietario y vuelve a ejecutar el instalador:
+
+```bash
+sudo chown "$USER:$USER" "$HOME/.local/bin"
+chmod u+w "$HOME/.local/bin"
+pwsh ./install.ps1
+```
+
+No ejecutes todo el instalador con `sudo`: los archivos quedarían a nombre de `root` y el problema se repetiría.
+
 ### Windows bloquea el script
 
 ```powershell
